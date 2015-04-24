@@ -26,7 +26,7 @@ public class OffHeapBitSet {
 
     private void checkIndex(long at) {
         if (at < 0 || at / 8 > buffer.remaining()) {
-            throw new IndexOutOfBoundsException();
+            throw new IndexOutOfBoundsException(String.format("at = %s, max = %s", at, buffer.remaining() * 8));
         }
     }
 

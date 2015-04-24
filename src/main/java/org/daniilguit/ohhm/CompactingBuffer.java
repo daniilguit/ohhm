@@ -5,32 +5,39 @@ import org.daniilguit.ohhm.util.OffHeapBitSet;
 
 import java.nio.ByteBuffer;
 import java.nio.IntBuffer;
-import java.util.Arrays;
 import java.util.Comparator;
+import java.util.List;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.locks.Lock;
+import java.util.concurrent.locks.ReentrantLock;
+import java.util.concurrent.locks.ReentrantReadWriteLock;
+import java.util.function.Consumer;
 import java.util.function.Function;
+import java.util.stream.Collectors;
 
 /**
  * Created by Daniil Gitelson on 22.04.15.
  */
 public class CompactingBuffer {
-    private static final int MEGABYTE = 1 << 20;
 
     private static final double COMPACTION_THRESHOLD = 0.8;
     private static final Comparator<Bucket> BUCKET_COMPARATOR = (o1, o2) -> Integer.compare(o1.available(), o2.available());
 
     private final int bucketSize;
     private final AtomicLong idGenerator = new AtomicLong();
+    private final AtomicInteger bucketsIdGenerator = new AtomicInteger();
+    private final ConcurrentHashMap<Integer, Bucket> buckets = new ConcurrentHashMap<>();
 
-    private volatile Bucket[] buckets;
-    private volatile Bucket[] sortedBuffers;
+    private final Lock compactionLock = new ReentrantLock();
+    private final Lock appenderLock = new ReentrantLock();
     private volatile BucketAppender bucketAppender;
 
     public CompactingBuffer(int bucketSize) {
         this.bucketSize = bucketSize;
-        sortedBuffers = buckets = new Bucket[]{allocateBufferState(0)};
-        bucketAppender = new BucketAppender(buckets[0]);
+        chooseNewAppendingBuffer();
     }
 
     public long append(ByteBuffer data) {
@@ -38,20 +45,40 @@ public class CompactingBuffer {
     }
 
     public long append(ByteBuffer data, long oldLocation) {
+        long id = oldLocation >= 0 ? getIdFor(oldLocation) : nextId();
+        int entrySize = entrySize(data.remaining(), id);
+        int offset;
+        BucketAppender bucketAppender = this.bucketAppender;
         try {
-            long id = oldLocation >= 0 ? getIdFor(oldLocation) : nextId();
-            int entrySize = entrySize(data.remaining(), id);
-            int offset;
-            BucketAppender bucketAppender;
             do {
-                offset = (bucketAppender = this.bucketAppender).requestOffset(entrySize);
+                offset = bucketAppender.requestOffset(entrySize);
                 if (offset < 0) {
-                    chooseNewAppendingBuffer(entrySize);
+                    appenderLock.lock();
+                    try {
+                        offset = (bucketAppender = this.bucketAppender).requestOffset(entrySize);
+                        if (offset < 0) {
+                            bucketAppender = chooseNewAppendingBuffer();
+                        }
+                    } finally {
+                        appenderLock.unlock();
+                    }
                 }
             } while (offset < 0);
-            return bucketAppender.put(offset, data, id, oldLocation);
+            return bucketAppender.put(offset, data, id, oldLocation, entrySize);
         } finally {
+            bucketAppender.bucket.lock.readLock().unlock();
+            assert bucketAppender.bucket.lock.getReadHoldCount() == 0;
         }
+    }
+
+    private BucketAppender chooseNewAppendingBuffer() {
+        if (bucketAppender != null) {
+            bucketAppender.bucket.active.set(false);
+        }
+        Bucket newBucket = allocateBufferState(bucketsIdGenerator.getAndIncrement() * 2);
+        buckets.put(newBucket.index, newBucket);
+        bucketAppender = new BucketAppender(newBucket);
+        return bucketAppender;
     }
 
     private long nextId() {
@@ -70,73 +97,89 @@ public class CompactingBuffer {
         return BufferUtils.packedSize(dataSize) + BufferUtils.packedSize(oldLocation) + dataSize;
     }
 
-    private void chooseNewAppendingBuffer(int size) {
-        try {
-            int bucketIndex = bucketAppender.bucket.sortedIndex;
-
-            while (bucketIndex >= 0 && sortedBuffers[bucketIndex].available() < size) {
-                bucketIndex--;
-            }
-            Bucket leastUsedBucket;
-            if (bucketIndex >= 0) {
-                leastUsedBucket = sortedBuffers[bucketIndex];
-            } else {
-                leastUsedBucket = allocateBufferState(buckets.length);
-                buckets = Arrays.copyOf(buckets, buckets.length + 1);
-                sortedBuffers = Arrays.copyOf(sortedBuffers, sortedBuffers.length + 1);
-                buckets[buckets.length - 1] = leastUsedBucket;
-                sortedBuffers[buckets.length - 1] = leastUsedBucket;
-            }
-            bucketAppender = new BucketAppender(leastUsedBucket);
-        } finally {
-        }
-    }
-
     private int offsetForLocation(long location) {
         return (int) (location % bucketSize);
     }
 
     private Bucket bucketForLocation(long location) {
-        return buckets[((int) (location / bucketSize))];
+        return buckets.get((int) (location / bucketSize));
     }
 
     private Bucket allocateBufferState(int index) {
         return new Bucket(ByteBuffer.allocateDirect(bucketSize), index);
     }
 
-    public <T> T evaluate(long location, Function<ByteBuffer, T> function) {
-        Bucket bucket = bucketForLocation(location);
+    public void access(LocationSupplier locationSupplier, Consumer<ByteBuffer> consumer) {
+        this.<Void>compute(locationSupplier, buffer -> {
+            consumer.accept(buffer);
+            return null;
+        });
+    }
+
+    @SuppressWarnings("StatementWithEmptyBody")
+    public <T> T compute(LocationSupplier locationSupplier, Function<ByteBuffer, T> consumer) {
+        Bucket bucket;
+        long location;
+        int counter = 0;
+        while ((bucket = bucketForLocation(location = locationSupplier.location())) == null) {
+            if (++counter > 10) {
+                throw new IllegalStateException();
+            }
+            // Loop
+        }
         ByteBuffer temp = bucket.bufferDuplicate();
         int offset = offsetForLocation(location);
         temp.position(offset);
         int size = BufferUtils.readPackedInt(temp);
         temp.limit(temp.position() + size);
-        return function.apply(temp);
+        return consumer.apply(temp);
     }
 
+
+    private final AtomicInteger comapctCounter = new AtomicInteger();
     public void compact(CompactionCallback callback) {
-        try {
-            new Compactor(buckets, callback).run();
-        } finally {
+        if (compactionLock.tryLock()) {
+            try {
+                new Compactor(callback).run();
+            } finally {
+                compactionLock.unlock();
+            }
         }
     }
 
     public long memoryUsage() {
-        return buckets.length * bucketSize;
+        return buckets.size() * bucketSize;
+    }
+
+    public long memoryOverhead() {
+        return buckets.values().stream().mapToInt(Bucket::available).reduce(0, Integer::sum);
+    }
+
+    public double memoryEfficiency() {
+        return 1 - 1.0 * memoryOverhead() / memoryUsage();
+    }
+
+    interface LocationSupplier {
+        long location();
     }
 
     private class Bucket {
         final ByteBuffer buffer;
         final int index;
+        final ReentrantReadWriteLock lock = new ReentrantReadWriteLock();
+        final AtomicBoolean active = new AtomicBoolean(true);
+        final AtomicInteger written = new AtomicInteger();
         final AtomicInteger limit = new AtomicInteger();
         final AtomicInteger count = new AtomicInteger();
         final AtomicInteger updates = new AtomicInteger();
-        volatile int sortedIndex;
 
         public Bucket(ByteBuffer buffer, int index) {
             this.buffer = buffer;
             this.index = index;
-            this.sortedIndex = index;
+        }
+
+        public boolean isFinished() {
+            return written.get() == limit.get() && !active.get();
         }
 
         public boolean needsCompaction() {
@@ -170,21 +213,25 @@ public class CompactingBuffer {
         }
 
         int requestOffset(int forSize) {
-            int gotOffset = offset.addAndGet(forSize);
-            if (gotOffset <= bucketSize) {
-                bucket.limit.addAndGet(forSize);
-                return gotOffset - forSize;
+            if (bucket.lock.readLock().tryLock()) {
+                int gotOffset = offset.addAndGet(forSize);
+                if (gotOffset <= bucketSize) {
+                    bucket.limit.addAndGet(forSize);
+                    return gotOffset - forSize;
+                } else {
+                    bucket.lock.readLock().unlock();
+                }
             }
             return -1;
         }
 
-        long put(int offset, ByteBuffer data, long id, long oldLocation) {
+        long put(int offset, ByteBuffer data, long id, long oldLocation, int entrySize) {
             ByteBuffer dest = bucket.bufferDuplicate();
             dest.position(offset);
             BufferUtils.writePackedLong(dest, data.remaining());
             BufferUtils.writeBuffer(dest, data);
             BufferUtils.writePackedLong(dest, id);
-
+            assert dest.position() - offset == entrySize;
             if (oldLocation >= 0) {
                 Bucket oldBucket = bucketForLocation(oldLocation);
                 oldBucket.updates.incrementAndGet();
@@ -194,33 +241,54 @@ public class CompactingBuffer {
             } else {
                 bucket.count.incrementAndGet();
             }
+            if (id != getIdFor(bucket.offsetToLocation(offset))) {
+                getIdFor(bucket.offsetToLocation(offset));
+            }
+            bucket.written.addAndGet(entrySize);
             return bucket.offsetToLocation(offset);
         }
     }
 
     private class Compactor {
-        private final Bucket[] buckets;
         private final CompactionCallback callback;
         private final OffHeapBitSet visited;
         private final IntBuffer bucketOffsets;
+        private final List<Bucket> bucketsSnapshot;
 
-        public Compactor(Bucket[] buckets, CompactionCallback callback) {
-            this.buckets = buckets;
+        public Compactor(CompactionCallback callback) {
             this.callback = callback;
-
-            long maxId = idGenerator.get();
+            List<Bucket> bucketsSnapshot = CompactingBuffer.this.buckets.values().stream().sorted((b1, b2) -> -Integer.compare(b1.index, b2.index)).collect(Collectors.toList());
+            // There could not be elements added but that fits into on bucket
+            long maxId = idGenerator.get() + bucketSize;
+            for (int i = 0; i < bucketsSnapshot.size(); i++) {
+                if (!bucketsSnapshot.get(i).isFinished()) {
+                    bucketsSnapshot = bucketsSnapshot.subList(0, i);
+                }
+            }
+            this.bucketsSnapshot = bucketsSnapshot;
             visited = new OffHeapBitSet(maxId);
             bucketOffsets = ByteBuffer.allocateDirect((bucketSize / 3 + 1) * Integer.BYTES).asIntBuffer();
         }
 
         public void run() {
-            for (int i = buckets.length - 1; i >= 0; i--) {
-                Bucket bucket = buckets[i];
-                ByteBuffer bucketBuffer = bucket.bufferDuplicate();
-                collectOffsets(bucket, bucketBuffer);
-                compactBucket(bucket, bucketBuffer);
+            BucketAppender bucketAppender = CompactingBuffer.this.bucketAppender;
+            try {
+                for (Bucket bucket : bucketsSnapshot) {
+                    bucket.lock.writeLock().lock();
+                    try {
+                        ByteBuffer bucketBuffer = bucket.bufferDuplicate();
+                        if (bucketAppender.bucket == bucket) {
+                            markGarbage(bucket, bucketBuffer);
+                        } else {
+                            collectOffsets(bucket, bucketBuffer);
+                            compactBucket(bucket, bucketBuffer);
+                        }
+                    } finally {
+                        bucket.lock.writeLock().unlock();
+                    }
+                }
+            } finally {
             }
-            sortBuffers();
 //            mergeBuckets();
         }
 
@@ -228,29 +296,16 @@ public class CompactingBuffer {
          * Merge buckets for compaction (todo)
          */
         private void mergeBuckets() {
-            int endMerge = sortedBuffers.length - 2;
-            int startMerge = endMerge;
-            int totalSize = 0;
-            while (startMerge >= 0 && totalSize < bucketSize) {
-                totalSize += sortedBuffers[startMerge].used();
-                startMerge--;
-            }
-            if (totalSize > bucketSize) {
-                startMerge++;
-            }
-            if (startMerge < endMerge) {
-                mergeBuckets(startMerge, endMerge);
-            }
         }
 
         private void mergeBuckets(int startMerge, int endMerge) {
-            Bucket destBucket = buckets[startMerge];
-            ByteBuffer destBuffer = destBucket.bufferDuplicate();
-            destBuffer.position(destBucket.used());
-            for (int i = startMerge + 1; i <= endMerge; i++) {
-                appendBucket(destBucket, destBuffer, buckets[i]);
-            }
-            destBucket.limit.set(destBuffer.position());
+//            Bucket destBucket = buckets[startMerge];
+//            ByteBuffer destBuffer = destBucket.bufferDuplicate();
+//            destBuffer.position(destBucket.used());
+//            for (int i = startMerge + 1; i <= endMerge; i++) {
+//                appendBucket(destBucket, destBuffer, buckets[i]);
+//            }
+//            destBucket.limit.set(destBuffer.position());
         }
 
         private void appendBucket(Bucket destBucket, ByteBuffer destBuffer, Bucket bucket) {
@@ -306,57 +361,54 @@ public class CompactingBuffer {
         }
 
         private void compactBucket(Bucket bucket, ByteBuffer sourceBuffer) {
-            Bucket newBucket = allocateBufferState(bucket.index);
+            Bucket newBucket = allocateBufferState(alternateIndex(bucket));
+            newBucket.active.set(false);
+            buckets.put(newBucket.index, newBucket);
             int limit = bucket.limit.get();
             sourceBuffer.limit(limit);
             ByteBuffer destBuffer = newBucket.buffer.duplicate();
+            ByteBuffer dataBuffer = sourceBuffer.duplicate();
             int copied = 0;
             int removed = 0;
             for (int i = bucketOffsets.limit() - 1; i >= 0; i--) {
                 int position = bucketOffsets.get(i);
 
-                sourceBuffer.limit(sourceBuffer.capacity());
                 sourceBuffer.position(position);
 
                 int dataSize = BufferUtils.readPackedInt(sourceBuffer);
                 int dataOffset = sourceBuffer.position();
                 BufferUtils.skip(sourceBuffer, dataSize);
                 long id = BufferUtils.readPackedLong(sourceBuffer);
-                int entryEnd = sourceBuffer.position();
+                int endPosition = sourceBuffer.position();
 
                 if (!visited.test(id)) {
                     visited.set(id);
 
-                    sourceBuffer.position(dataOffset);
-                    sourceBuffer.limit(dataOffset + dataSize);
-                    callback.updated(sourceBuffer, bucket.offsetToLocation(destBuffer.position()));
+                    int destPosition = destBuffer.position();
+                    BufferUtils.locate(dataBuffer, position, endPosition - position);
+                    destBuffer.put(dataBuffer);
 
-                    sourceBuffer.limit(entryEnd);
-                    sourceBuffer.position(position);
-                    destBuffer.put(sourceBuffer);
+                    BufferUtils.locate(dataBuffer, dataOffset, dataSize);
+                    callback.updated(dataBuffer, newBucket.offsetToLocation(destPosition));
 
                     copied++;
                 } else {
                     removed++;
                 }
             }
-            newBucket.limit.set(destBuffer.position());
-            newBucket.count.set(copied);
-            newBucket.updates.set(0);
-            newBucket.sortedIndex = bucket.sortedIndex;
+            if (destBuffer.position() == 0) {
+                bucketsSnapshot.remove(bucket.index);
+            } else {
+                newBucket.limit.set(destBuffer.position());
+                newBucket.count.set(copied);
+                newBucket.updates.set(0);
 
-            buckets[bucket.index] = newBucket;
-            sortedBuffers[bucket.sortedIndex] = newBucket;
+                buckets.remove(bucket.index, bucket);
+            }
         }
 
-        private void sortBuffers() {
-            try {
-                Arrays.sort(sortedBuffers, BUCKET_COMPARATOR);
-                for (int i = 0; i < sortedBuffers.length; i++) {
-                    sortedBuffers[i].sortedIndex = i;
-                }
-            } finally {
-            }
+        private int alternateIndex(Bucket bucket) {
+            return (bucket.index & ~1) + (1 - (bucket.index & 1));
         }
     }
 }

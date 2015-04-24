@@ -6,6 +6,12 @@ import java.nio.ByteBuffer;
  * Created by Daniil Gitelson on 17.04.15.
  */
 public class BufferUtils {
+    public static ByteBuffer locate(ByteBuffer buffer, int position, int length) {
+        buffer.limit(position + length);
+        buffer.position(position);
+        return buffer;
+    }
+
     public static void skip(ByteBuffer dest, int length) {
         dest.position(dest.position() + length);
     }
@@ -19,7 +25,7 @@ public class BufferUtils {
 
     public static int packedSize(long value) {
         int bits = Long.SIZE - Long.numberOfLeadingZeros(value);
-        return bits / 7 + (bits % 7 != 0 ? 1 : 0);
+        return Math.max(bits / 7 + (bits % 7 != 0 ? 1 : 0), 1);
     }
 
     public static int writePackedLong(ByteBuffer output, long value) {
