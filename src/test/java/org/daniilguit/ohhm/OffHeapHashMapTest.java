@@ -23,11 +23,12 @@ public class OffHeapHashMapTest {
         Random random = new Random(0);
         OffHeapHashMap hashMap = new OffHeapHashMap(new OffHeapHashMapConfig());
 
-        int n = 10000;
+        int N = 10000;
 
-        for (int i = 0; i < 5 * n; i++) {
-            int key = random.nextInt(n);
-            int value = random.nextInt(n);
+        for (int i = 0; i < 5 * N; i++) {
+            int key = random.nextInt(N);
+            int value = random.nextInt(N);
+
             expected.put(key, value);
             hashMap.entry(bufferForInt(key)).put(bufferForInt(value));
         }

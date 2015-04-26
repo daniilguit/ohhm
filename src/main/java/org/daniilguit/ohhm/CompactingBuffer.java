@@ -13,7 +13,6 @@ import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.locks.Lock;
 import java.util.concurrent.locks.ReentrantLock;
-import java.util.concurrent.locks.ReentrantReadWriteLock;
 import java.util.function.Consumer;
 import java.util.function.Function;
 import java.util.stream.Collectors;
@@ -31,7 +30,7 @@ public class CompactingBuffer {
     private final AtomicInteger bucketsIdGenerator = new AtomicInteger();
     private final ConcurrentHashMap<Integer, Bucket> buckets = new ConcurrentHashMap<>();
 
-    private final Lock compactionLock = new ReentrantLock();
+    private final AtomicBoolean compactionState = new AtomicBoolean();
     private final Lock appenderLock = new ReentrantLock();
     private volatile BucketAppender bucketAppender;
 
@@ -45,30 +44,26 @@ public class CompactingBuffer {
     }
 
     public long append(ByteBuffer data, long oldLocation) {
+        assert data.remaining() > 0;
         long id = oldLocation >= 0 ? getIdFor(oldLocation) : nextId();
         int entrySize = entrySize(data.remaining(), id);
         int offset;
         BucketAppender bucketAppender = this.bucketAppender;
-        try {
-            do {
-                offset = bucketAppender.requestOffset(entrySize);
-                if (offset < 0) {
-                    appenderLock.lock();
-                    try {
-                        offset = (bucketAppender = this.bucketAppender).requestOffset(entrySize);
-                        if (offset < 0) {
-                            bucketAppender = chooseNewAppendingBuffer();
-                        }
-                    } finally {
-                        appenderLock.unlock();
+        do {
+            offset = bucketAppender.requestOffset(entrySize);
+            if (offset < 0) {
+                appenderLock.lock();
+                try {
+                    offset = (bucketAppender = this.bucketAppender).requestOffset(entrySize);
+                    if (offset < 0) {
+                        bucketAppender = chooseNewAppendingBuffer();
                     }
+                } finally {
+                    appenderLock.unlock();
                 }
-            } while (offset < 0);
-            return bucketAppender.put(offset, data, id, oldLocation, entrySize);
-        } finally {
-            bucketAppender.bucket.lock.readLock().unlock();
-            assert bucketAppender.bucket.lock.getReadHoldCount() == 0;
-        }
+            }
+        } while (offset < 0);
+        return bucketAppender.put(offset, data, id, oldLocation, entrySize);
     }
 
     private BucketAppender chooseNewAppendingBuffer() {
@@ -109,23 +104,19 @@ public class CompactingBuffer {
         return new Bucket(ByteBuffer.allocateDirect(bucketSize), index);
     }
 
+    @SuppressWarnings("StatementWithEmptyBody")
     public void access(LocationSupplier locationSupplier, Consumer<ByteBuffer> consumer) {
-        this.<Void>compute(locationSupplier, buffer -> {
+
+        while (this.<Boolean>compute(locationSupplier.location(), buffer -> {
             consumer.accept(buffer);
-            return null;
-        });
+            return true;
+        })) ;
     }
 
-    @SuppressWarnings("StatementWithEmptyBody")
-    public <T> T compute(LocationSupplier locationSupplier, Function<ByteBuffer, T> consumer) {
+    public <T> T compute(long location, Function<ByteBuffer, T> consumer) {
         Bucket bucket;
-        long location;
-        int counter = 0;
-        while ((bucket = bucketForLocation(location = locationSupplier.location())) == null) {
-            if (++counter > 10) {
-                throw new IllegalStateException();
-            }
-            // Loop
+        if ((bucket = bucketForLocation(location)) == null) {
+            return null;
         }
         ByteBuffer temp = bucket.bufferDuplicate();
         int offset = offsetForLocation(location);
@@ -137,12 +128,13 @@ public class CompactingBuffer {
 
 
     private final AtomicInteger comapctCounter = new AtomicInteger();
+
     public void compact(CompactionCallback callback) {
-        if (compactionLock.tryLock()) {
+        if (compactionState.compareAndSet(false, true)) {
             try {
                 new Compactor(callback).run();
             } finally {
-                compactionLock.unlock();
+                compactionState.set(false);
             }
         }
     }
@@ -166,7 +158,6 @@ public class CompactingBuffer {
     private class Bucket {
         final ByteBuffer buffer;
         final int index;
-        final ReentrantReadWriteLock lock = new ReentrantReadWriteLock();
         final AtomicBoolean active = new AtomicBoolean(true);
         final AtomicInteger written = new AtomicInteger();
         final AtomicInteger limit = new AtomicInteger();
@@ -213,14 +204,10 @@ public class CompactingBuffer {
         }
 
         int requestOffset(int forSize) {
-            if (bucket.lock.readLock().tryLock()) {
-                int gotOffset = offset.addAndGet(forSize);
-                if (gotOffset <= bucketSize) {
-                    bucket.limit.addAndGet(forSize);
-                    return gotOffset - forSize;
-                } else {
-                    bucket.lock.readLock().unlock();
-                }
+            int gotOffset = offset.addAndGet(forSize);
+            if (gotOffset <= bucketSize) {
+                bucket.limit.addAndGet(forSize);
+                return gotOffset - forSize;
             }
             return -1;
         }
@@ -272,24 +259,16 @@ public class CompactingBuffer {
 
         public void run() {
             BucketAppender bucketAppender = CompactingBuffer.this.bucketAppender;
-            try {
-                for (Bucket bucket : bucketsSnapshot) {
-                    bucket.lock.writeLock().lock();
-                    try {
-                        ByteBuffer bucketBuffer = bucket.bufferDuplicate();
-                        if (bucketAppender.bucket == bucket) {
-                            markGarbage(bucket, bucketBuffer);
-                        } else {
-                            collectOffsets(bucket, bucketBuffer);
-                            compactBucket(bucket, bucketBuffer);
-                        }
-                    } finally {
-                        bucket.lock.writeLock().unlock();
-                    }
+            for (Bucket bucket : bucketsSnapshot) {
+                ByteBuffer bucketBuffer = bucket.bufferDuplicate();
+                if (bucketAppender.bucket == bucket) {
+                    markGarbage(bucket, bucketBuffer);
+                } else {
+                    collectOffsets(bucket, bucketBuffer);
+                    compactBucket(bucket, bucketBuffer);
                 }
-            } finally {
             }
-//            mergeBuckets();
+            //            mergeBuckets();
         }
 
         /**
@@ -323,7 +302,7 @@ public class CompactingBuffer {
                 dataBuffer.position(sourceBuffer.position());
                 BufferUtils.skip(sourceBuffer, size);
                 BufferUtils.readPackedLong(sourceBuffer);
-                callback.updated(dataBuffer, destBucket.offsetToLocation(offset + position));
+//                callback.updated(dataBuffer,bucket. , destBucket.offsetToLocation(offset + position));
             }
         }
 
@@ -389,7 +368,7 @@ public class CompactingBuffer {
                     destBuffer.put(dataBuffer);
 
                     BufferUtils.locate(dataBuffer, dataOffset, dataSize);
-                    callback.updated(dataBuffer, newBucket.offsetToLocation(destPosition));
+                    callback.updated(dataBuffer, bucket.offsetToLocation(position), newBucket.offsetToLocation(destPosition));
 
                     copied++;
                 } else {

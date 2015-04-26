@@ -47,7 +47,7 @@ public class CompactingBufferTest {
         }
         CompactionCallback callback = new CompactionCallback() {
             @Override
-            public void updated(ByteBuffer input, long newLocation) {
+            public void updated(ByteBuffer input, long oldLocation, long newLocation) {
                 int key = keyFromBuffer(input);
                 locations[key] = newLocation;
             }
@@ -95,12 +95,11 @@ public class CompactingBufferTest {
         ExecutorService executorService = Executors.newFixedThreadPool(4);
         CompactionCallback callback = new CompactionCallback() {
             @Override
-            public void updated(ByteBuffer input, long newLocation) {
+            public void updated(ByteBuffer input, long oldLocation, long newLocation) {
                 int key = keyFromBuffer(input);
-                locations.set(key, newLocation);
+                locations.compareAndSet(key, oldLocation, newLocation);
             }
         };
-
 
         for (int r = 0; r < 100; r++) {
             for (int i = 0; i < locations.length(); i++) {
@@ -128,6 +127,7 @@ public class CompactingBufferTest {
         }
         executorService.shutdown();
         executorService.awaitTermination(1, TimeUnit.DAYS);
+        buckets.compact(callback);
 
         for (int i = 0; i < locations.length(); i++) {
             int ii = i;
