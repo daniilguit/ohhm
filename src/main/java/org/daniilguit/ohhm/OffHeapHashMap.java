@@ -35,8 +35,17 @@ public class OffHeapHashMap {
 
         public OffHeapHashMapPartition(OffHeapHashMapConfig config, double density) {
             hashTable = new HashTable(config.initialSize / config.partitions);
-            compactingBuffer = new CompactingBuffer(config.bucketSize);
+            compactingBuffer = new CompactingBuffer(config.bucketSize, this);
             this.density = density;
+        }
+
+        @Override
+        public boolean isGarbage(ByteBuffer data, long location) {
+            ByteBuffer key = data;
+            int keySize = BufferUtils.readPackedInt(key);
+            key.limit(keySize);
+
+            return hashTable.contains(key.hashCode(), location);
         }
 
         @Override
@@ -91,14 +100,13 @@ public class OffHeapHashMap {
             }
 
             public void put(ByteBuffer value) {
-                getLocation();
-                ByteBuffer entry = ByteBuffer.allocate(key.remaining() + value.remaining() + BufferUtils.packedSize(key.remaining()));
+                long oldLocation = getLocation();
+                ByteBuffer entry = ByteBuffer.allocate(key.remaining() + value.remaining() + BufferUtils.packedLongSize(key.remaining()));
                 BufferUtils.writePackedLong(entry, key.remaining());
                 BufferUtils.writeBuffer(entry, key);
                 BufferUtils.writeBuffer(entry, value);
                 entry.position(0);
-                long oldLocation = this.location;
-                this.location = compactingBuffer.append(entry, oldLocation);
+                this.location = compactingBuffer.append(entry);
                 if (oldLocation < 0) {
                     if (!hashTable.insert(hash, location) || hashTable.density() > density) {
                         HashTable newTable = new HashTable(hashTable.size() * 3 / 2);

@@ -23,7 +23,7 @@ public class BufferUtils {
     }
 
 
-    public static int packedSize(long value) {
+    public static int packedLongSize(long value) {
         int bits = Long.SIZE - Long.numberOfLeadingZeros(value);
         return Math.max(bits / 7 + (bits % 7 != 0 ? 1 : 0), 1);
     }

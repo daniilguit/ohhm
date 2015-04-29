@@ -21,9 +21,9 @@ public class HashTable {
     private final int entries;
 
     public interface LookupPredicate {
+
         boolean check(long location);
     }
-
     public HashTable(int size) {
         entries = Math.max(size, MIN_TABLE_SIZE);
         table = new DirectBuffer(entries * TABLE_ENTRY_SIZE);
@@ -58,6 +58,22 @@ public class HashTable {
             return getLocationAtOffset(offset);
         }
         return -1;
+    }
+
+    public boolean contains(int hash, long location) {
+        for (int offset = getStartOffsetInChain(hash); offset >= 0; offset = getNextInChain(offset)) {
+            int entryHash = getHashAtOffset(offset);
+            if (hash != entryHash) {
+                continue;
+            }
+            long locationAtOffset = getLocationAtOffset(offset);
+            if (locationAtOffset == location) {
+                return true;
+            }
+        }
+
+        return false;
+
     }
 
     public int find(int hash, LookupPredicate predicate) {

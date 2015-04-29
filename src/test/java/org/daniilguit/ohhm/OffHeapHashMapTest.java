@@ -14,7 +14,6 @@ import static org.junit.Assert.assertEquals;
 /**
  * Created by Daniil Gitelson on 23.04.15.
  */
-@Ignore
 public class OffHeapHashMapTest {
 
     @Test
