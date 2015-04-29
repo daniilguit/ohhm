@@ -80,14 +80,14 @@ public class CompactingBuffer {
         if (bucketAppender != null) {
             bucketAppender.bucket.active.set(false);
         }
-        bucketAppender = new BucketAppender(allocateBucket(nextBucketId(), true));
+        bucketAppender = new BucketAppender(allocateBucket(true));
         return bucketAppender;
     }
 
     private int nextBucketId() {
         int id;
         do {
-            id = bucketsIdGenerator.getAndIncrement() * 2;
+            id = bucketsIdGenerator.getAndIncrement();
         } while (buckets.containsKey(id));
         return id;
     }
@@ -104,14 +104,13 @@ public class CompactingBuffer {
         return buckets.get((int) (location >> 32));
     }
 
-    private Bucket allocateBucket(int index, boolean active) {
-        Bucket bucket = new Bucket(ByteBuffer.allocateDirect(bucketSize), index, active);
+    private Bucket allocateBucket(boolean active) {
+        Bucket bucket = new Bucket(ByteBuffer.allocateDirect(bucketSize), nextBucketId(), active);
         assert !buckets.containsKey(bucket.index);
         buckets.put(bucket.index, bucket);
         return bucket;
     }
 
-    @SuppressWarnings("StatementWithEmptyBody")
     public void access(LongSupplier locationSupplier, Consumer<ByteBuffer> consumer) {
         for (int count = 0; count < 10; count++) {
             if (this.<Boolean>compute(locationSupplier.getAsLong(), buffer -> {
@@ -138,6 +137,10 @@ public class CompactingBuffer {
     }
 
 
+    public long memoryUsage() {
+        return buckets.values().stream().mapToInt(Bucket::used).sum();
+    }
+
     public void compact() {
         if (compactionState.compareAndSet(false, true)) {
             try {
@@ -149,7 +152,6 @@ public class CompactingBuffer {
     }
 
     private void doCompact() {
-
         new GarbageCollector(inactiveBuckets()).run();
 
         List<Bucket> buckets = inactiveBuckets();
@@ -162,16 +164,8 @@ public class CompactingBuffer {
         return buckets.values().stream().filter(Bucket::isFinished).collect(Collectors.toList());
     }
 
-    public long memoryUsage() {
-        return buckets.size() * bucketSize;
-    }
-
     private static double memoryEfficiency(Collection<Bucket> buckets) {
-        return 1. * buckets.stream().mapToInt(Bucket::used).reduce(0, Integer::sum) / buckets.stream().mapToInt(b -> b.buffer.capacity()).reduce(0, Integer::sum);
-    }
-
-    public double memoryEfficiency() {
-        return memoryEfficiency(buckets.values());
+        return 1. * buckets.stream().mapToInt(Bucket::used).sum() / buckets.stream().mapToInt(b -> b.buffer.capacity()).sum();
     }
 
     private class Bucket {
@@ -265,15 +259,15 @@ public class CompactingBuffer {
         }
 
         private void compactBucket(Bucket bucket) {
-            OffHeapBitSet garbageFlags = new OffHeapBitSet(bucket.used());
-            int garbageSize = calculateGarbageInfo(bucket, garbageFlags);
+            OffHeapBitSet garbageMap = new OffHeapBitSet(bucket.used());
+            int garbageSize = calculateGarbageInfo(bucket, garbageMap);
 
             if (garbageSize == bucket.used()) {
                 // All entries in bucket are garbage
                 bucket.remove();
             } else {
                 if (bucket.efficiency(garbageSize) < compactionThreshold) {
-                    doCompactBucket(bucket, garbageFlags);
+                    doCompactBucket(bucket, garbageMap);
                 }
             }
         }
@@ -303,7 +297,7 @@ public class CompactingBuffer {
 
             sourceBuffer.limit(bucket.limit.get());
 
-            Bucket newBucket = allocateBucket(alternateIndex(bucket), false);
+            Bucket newBucket = allocateBucket(false);
             ByteBuffer destBuffer = newBucket.buffer.duplicate();
 
             while (sourceBuffer.remaining() > 0) {
@@ -345,7 +339,7 @@ public class CompactingBuffer {
             bucketsToCompact.stream()
                     // Do not compact buckets that are almost full for performance reasons
                     .filter(bucket -> bucket.efficiency() < compactionThreshold)
-                    // Heuristics: compact buckets from less used to more used
+                            // Heuristics: compact buckets from less used to more used
                     .sorted(Comparator.comparingInt(Bucket::used))
                     .forEachOrdered(this::appendBucket);
         }
@@ -368,7 +362,7 @@ public class CompactingBuffer {
                         // Split bucket into two parts, first one copy to destination buffer
                         // Next one clone and set as new destination bucket
                         appendBucket(bucket, BufferUtils.locate(sourceBuffer, 0, splitAround));
-                        setDestinationBucket(allocateBucket(alternateIndex(bucket), false));
+                        setDestinationBucket(allocateBucket(false));
                         appendBucket(bucket, BufferUtils.locate(sourceBuffer, splitAround, bucket.used() - splitAround));
                         bucket.remove();
                     }
@@ -416,11 +410,5 @@ public class CompactingBuffer {
                 BufferUtils.skip(sourceBuffer, size);
             }
         }
-    }
-
-    private int alternateIndex(Bucket bucket) {
-        // Invert last bit
-//        return bucket.index ^ 1;
-        return nextBucketId();
     }
 }

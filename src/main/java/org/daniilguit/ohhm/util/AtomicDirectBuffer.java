@@ -8,7 +8,7 @@ import java.nio.ByteBuffer;
 /**
  * Created by Daniil Gitelson on 26.04.15.
  */
-public class DirectBuffer {
+public class AtomicDirectBuffer {
     private static final Unsafe unsafe;
 
     static {
@@ -25,7 +25,7 @@ public class DirectBuffer {
     private final ByteBuffer buffer;
     private final long address;
 
-    public DirectBuffer(int size) {
+    public AtomicDirectBuffer(int size) {
         this.size = size;
         buffer = ByteBuffer.allocateDirect(size);
         address = ((sun.nio.ch.DirectBuffer) buffer).address();

@@ -1,4 +1,4 @@
-package org.daniilguit.ohhm;
+package org.daniilguit.ohhm.util;
 
 import java.util.concurrent.locks.Lock;
 import java.util.concurrent.locks.ReentrantLock;

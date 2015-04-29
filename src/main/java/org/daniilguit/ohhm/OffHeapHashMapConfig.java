@@ -10,5 +10,4 @@ public class OffHeapHashMapConfig {
     public int bucketSize = MEGABYTE;
     public int partitions = Runtime.getRuntime().availableProcessors();
     public float tableDensity = 0.7f;
-    public int compactionInterval = 60;
 }

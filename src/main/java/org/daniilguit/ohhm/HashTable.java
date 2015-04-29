@@ -1,6 +1,6 @@
 package org.daniilguit.ohhm;
 
-import org.daniilguit.ohhm.util.DirectBuffer;
+import org.daniilguit.ohhm.util.AtomicDirectBuffer;
 
 import java.util.concurrent.atomic.AtomicInteger;
 
@@ -16,8 +16,8 @@ public class HashTable {
     private final AtomicInteger count = new AtomicInteger();
     private final AtomicInteger chainsCount = new AtomicInteger();
 
-    private final DirectBuffer table;
-    private final DirectBuffer chains;
+    private final AtomicDirectBuffer table;
+    private final AtomicDirectBuffer chains;
     private final int entries;
 
     public interface LookupPredicate {
@@ -26,8 +26,8 @@ public class HashTable {
     }
     public HashTable(int size) {
         entries = Math.max(size, MIN_TABLE_SIZE);
-        table = new DirectBuffer(entries * TABLE_ENTRY_SIZE);
-        chains = new DirectBuffer(entries * VALUE_ENTRY_SIZE);
+        table = new AtomicDirectBuffer(entries * TABLE_ENTRY_SIZE);
+        chains = new AtomicDirectBuffer(entries * VALUE_ENTRY_SIZE);
     }
 
     public int size() {

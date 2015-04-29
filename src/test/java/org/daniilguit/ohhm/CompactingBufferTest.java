@@ -1,6 +1,7 @@
 package org.daniilguit.ohhm;
 
 import org.daniilguit.ohhm.util.BufferUtils;
+import org.daniilguit.ohhm.util.LockManager;
 import org.junit.Test;
 
 import java.nio.ByteBuffer;
